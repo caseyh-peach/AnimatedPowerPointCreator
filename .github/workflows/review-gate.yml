@@ -43,13 +43,15 @@ jobs:
             -f query='query($owner:String!,$name:String!,$pr:Int!){
               repository(owner:$owner,name:$name){
                 pullRequest(number:$pr){
-                  reviewThreads(first:100){nodes{isResolved}}
+                  reviewThreads(first:100){nodes{isResolved isOutdated}}
                   reviews(last:100){nodes{author{login} submittedAt commit{oid}}}
                 }
               }
             }')
 
-          unresolved=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)] | length' <<<"$data")
+          # Outdated threads (superseded diffs) don't block â€” same clean definition the
+          # codex-review-response skill uses; the gate and the skill must agree.
+          unresolved=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select((.isResolved|not) and (.isOutdated|not))] | length' <<<"$data")
           codex_rounds_this_head=$(jq --arg sha "$HEAD_SHA" --arg bot "$CODEX_LOGIN" \
             '[.data.repository.pullRequest.reviews.nodes[] | select(.author.login==$bot and .commit.oid==$sha)] | length' <<<"$data")
 
