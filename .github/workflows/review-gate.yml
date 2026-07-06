@@ -1,0 +1,67 @@
+# review-gate â€” the mirror gate (D8, Review Gauntlet)
+# CANONICAL COPY: caseyh-peach/TheApiary Â· infrastructure/review-gate/review-gate.yml
+# Deployed per estate repo as .github/workflows/review-gate.yml (see deploy-review-gate.ps1).
+# It runs NO review of its own â€” it mirrors the cloud Codex review's state as a commit status:
+#   pending  = push happened, no Codex round posted for this head yet ("review in progress")
+#   failure  = round posted, unresolved Codex threads remain on this head
+#   success  = round posted for this head, zero unresolved threads (clean round)
+# Thread resolution fires no webhook: the scheduled estate sweep (TheApiary review-sweep.yml)
+# re-evaluates open PRs to catch dispose-only rounds; a normal fix-push re-triggers this anyway.
+name: review-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  statuses: write
+  pull-requests: read
+
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror Codex review state to the review-gate status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CODEX_LOGIN: chatgpt-codex-connector
+        run: |
+          set -euo pipefail
+          owner="${REPO%/*}"; name="${REPO#*/}"
+
+          data=$(gh api graphql \
+            -F owner="$owner" -F name="$name" -F pr="$PR" \
+            -f query='query($owner:String!,$name:String!,$pr:Int!){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$pr){
+                  reviewThreads(first:100){nodes{isResolved}}
+                  reviews(last:100){nodes{author{login} submittedAt commit{oid}}}
+                }
+              }
+            }')
+
+          unresolved=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)] | length' <<<"$data")
+          codex_rounds_this_head=$(jq --arg sha "$HEAD_SHA" --arg bot "$CODEX_LOGIN" \
+            '[.data.repository.pullRequest.reviews.nodes[] | select(.author.login==$bot and .commit.oid==$sha)] | length' <<<"$data")
+
+          if [ "$codex_rounds_this_head" -eq 0 ]; then
+            state=pending; desc="Codex round in progress for ${HEAD_SHA:0:7} - no review posted yet"
+          elif [ "$unresolved" -gt 0 ]; then
+            state=failure; desc="$unresolved unresolved review thread(s) - work the round"
+          else
+            state=success; desc="clean round - zero unresolved threads on ${HEAD_SHA:0:7}"
+          fi
+
+          echo "review-gate: $state ($desc)"
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context=review-gate -f description="$desc" \
+            -f target_url="https://github.com/$REPO/pull/$PR"
