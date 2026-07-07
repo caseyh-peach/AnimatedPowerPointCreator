@@ -173,6 +173,9 @@ jobs:
           # NB: fetch and filter are SEPARATE commands — gh rejects --paginate --slurp combined
           # with --jq (proven in run logs: every prior round silently fell to the no-memory
           # fallback), so the pages land in a file and the runner's real jq does the filtering.
+          # FAIL CLOSED: memory assembly has no fallback — a review without prior DISPOSED
+          # replies re-litigates settled findings, the exact failure D12 exists to prevent.
+          # set -e fails the step here; the crash handler marks the round for re-invoke.
           {
             echo ""
             echo "## Round memory (prior rounds and builder replies on this PR, oldest first)"
@@ -183,7 +186,7 @@ jobs:
                 or
                 ((.body | test("^(FIXED|DISPOSED|SOLVED)")) and (.author_association | IN("OWNER","MEMBER","COLLABORATOR")))
               )) | .[] | "---\n[" + .user.login + " · " + .created_at + "]\n" + .body' "$RUNNER_TEMP/comments.json"
-          } >> "$RUNNER_TEMP/prompt.md" || echo "(round memory unavailable - review without it)" >> "$RUNNER_TEMP/prompt.md"
+          } >> "$RUNNER_TEMP/prompt.md"
 
       - name: Run the reviewer (GPT-5.5 · thinking high)
         id: codex
@@ -200,13 +203,23 @@ jobs:
           PR: ${{ needs.guard.outputs.pr }}
           HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
         run: |
+          # The status IS the merge signal - writes retry, and a green exit REQUIRES the green
+          # status to have landed (a PASS with a stale/pending required status would strand the
+          # gate). Failure-path writes stay best-effort: the job's own exit 1 already reddens
+          # the run, and the crash handler re-tries any stranded pending.
           set_status() {
-            gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
-              -f state="$1" -f context=pr-gauntlet/review -f description="$2" \
-              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
+            for attempt in 1 2 3; do
+              if gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+                   -f state="$1" -f context=pr-gauntlet/review -f description="$2" \
+                   -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; then
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
           }
           if [ -z "$REVIEW" ]; then
-            set_status failure "round produced no output - re-invoke"
+            set_status failure "round produced no output - re-invoke" || true
             echo "::error::the reviewer produced no output - treat as a failed round, re-invoke"
             exit 1
           fi
@@ -218,10 +231,13 @@ jobs:
           # (e.g. reviewing these very docs) must not pass a FAIL round.
           FINAL_VERDICT=$(grep -E '^VERDICT: (PASS|FAIL)$' review.md | tail -n 1)
           if [ "$FINAL_VERDICT" = "VERDICT: PASS" ]; then
-            set_status success "clean round for ${HEAD_SHA:0:7}"
+            if ! set_status success "clean round for ${HEAD_SHA:0:7}"; then
+              echo "::error::round PASSED but the success status could not be written - the merge signal is stale; re-invoke"
+              exit 1
+            fi
             echo "pr-gauntlet review: PASS"
           else
-            set_status failure "P1/P2 findings posted - work the round"
+            set_status failure "P1/P2 findings posted - work the round" || true
             echo "::error::pr-gauntlet review verdict: ${FINAL_VERDICT:-MISSING} - P1/P2 findings posted on the PR"
             exit 1
           fi
