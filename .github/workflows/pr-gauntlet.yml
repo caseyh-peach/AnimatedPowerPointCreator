@@ -1,18 +1,25 @@
-# pr-gauntlet â€” THE estate PR workflow (D11): one shape on every repo, PR â†’ main.
-# CANONICAL COPY: caseyh-peach/TheApiary Â· infrastructure/pr-gauntlet/pr-gauntlet.yml
+# pr-gauntlet — THE estate PR workflow (D11): one shape on every repo, PR → main.
+# CANONICAL COPY: caseyh-peach/TheApiary · infrastructure/pr-gauntlet/pr-gauntlet.yml
 # Deployed per repo as .github/workflows/pr-gauntlet.yml by deploy-pr-gauntlet.ps1.
 # Three standardized jobs:
-#   guard    â€” AGENTS.md must exist (the reviewer's contract; enforced, never policy-hoped)
-#   review   â€” the direct-invoke reviewer (GPT-5.5 Â· thinking-high Â· priority tier) WITH round
-#              memory (D12): prior rounds + the builder's FIXED/DISPOSED replies feed the prompt,
-#              so disposals stick and fixes get re-verified instead of re-litigated
-#   validate â€” optional, standardized: runs .github/validate.ps1 if the repo carries one
-# The review job's pass/fail (its VERDICT line) is the merge signal.
+#   guard    — AGENTS.md must exist (the reviewer's contract; enforced, never policy-hoped)
+#   review   — the direct-invoke reviewer (GPT-5.5 · thinking-high) WITH round memory (D12):
+#              prior rounds + the builder's FIXED/DISPOSED replies feed the prompt, so disposals
+#              stick and fixes get re-verified instead of re-litigated
+#   validate — optional, standardized: runs .github/validate.ps1 if the repo carries one
+# The review job's red/green is the merge signal - dial-aware (D15): on dial:ship-to-learn the
+# gate is the presence of P1 findings in the round's own output; standard/high-stakes gate on
+# the VERDICT line.
 # Secret required per repo: OPENAI_API_KEY (rotate via ../pr-gauntlet/set-openai-key.ps1).
 name: pr-gauntlet
 
+# pull_request_target (not pull_request): the workflow DEFINITION always runs from the default
+# branch, so a PR cannot edit the gauntlet that judges it (or use this workflow's statuses:write
+# to forge its own pr-gauntlet/review success). The PR's code is still what gets reviewed - the
+# review job checks out refs/pull/<n>/merge explicitly - and the reviewer contract (AGENTS.md +
+# prompt) is separately pinned to the default branch below.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
@@ -21,9 +28,11 @@ on:
         required: true
         type: string
 
+# Default the token to read-only; the jobs that write (guard/review: statuses + the round
+# comment) escalate per-job. validate runs REPO-SUPPLIED code from the PR head, so it must
+# never see a write-capable token.
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: pr-gauntlet-${{ github.event.pull_request.number || github.event.inputs.pr }}
@@ -32,6 +41,10 @@ concurrency:
 jobs:
   guard:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read   # the dispatch path resolves the head sha via gh pr view
+      statuses: write
     outputs:
       pr: ${{ steps.pr.outputs.num }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
@@ -49,6 +62,16 @@ jobs:
           fi
           echo "head_sha=$SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Fork PRs need a human invoke (pull_request_target runs with secrets)
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          # pull_request_target exposes secrets to the run, and review/validate execute against
+          # the PR's content. Estate PRs are same-repo (owner + collaborators); a FORK PR is
+          # outside that trust boundary, so it never auto-runs. After a human reads the diff:
+          #   gh workflow run pr-gauntlet -f pr=<N>
+          echo "::error::fork-origin PR - the gauntlet does not auto-run outside the repo's trust boundary. Inspect the diff, then invoke: gh workflow run pr-gauntlet -f pr=${{ github.event.pull_request.number }}"
+          exit 1
+
       - name: AGENTS.md must exist (the reviewer's contract)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,15 +82,75 @@ jobs:
           fi
           echo "guard: AGENTS.md present"
 
+      - name: Mark the head as in-review (sha-attached status, trigger-independent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The commit STATUS (context pr-gauntlet/review) rides the PR head sha itself, so
+          # required-check wiring works identically for push rounds AND on-demand rounds
+          # (a plain workflow_dispatch run's job check attaches to the dispatch ref, not the PR).
+          gh api "repos/$GITHUB_REPOSITORY/statuses/${{ steps.pr.outputs.head_sha }}" \
+            -f state=pending -f context=pr-gauntlet/review \
+            -f description="round in progress" \
+            -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
   review:
     runs-on: ubuntu-latest
     needs: guard
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
     steps:
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ needs.guard.outputs.pr }}/merge
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Merge ref must be fresh for the reviewed head (it updates asynchronously)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.guard.outputs.pr }}
+          HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # GitHub recomputes refs/pull/N/merge asynchronously after a push. Reviewing a stale
+          # merge result would stamp this round's verdict on a head the reviewer never read.
+          # Wait until the merge commit's PR-side parent IS the reviewed head (or fail the round;
+          # the crash handler writes the terminal status and a re-invoke reruns cleanly).
+          # persist-credentials is off, so re-fetches auth via the token header (checkout's own
+          # pattern) - a plain git fetch has no credentials on a private repo.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          for i in 1 2 3 4 5 6; do
+            MERGE_PR_PARENT=$(git rev-parse -q --verify HEAD^2 || true)
+            if [ "$MERGE_PR_PARENT" = "$HEAD_SHA" ]; then
+              echo "merge ref fresh: HEAD^2 = $HEAD_SHA"; exit 0
+            fi
+            echo "merge ref stale (PR parent ${MERGE_PR_PARENT:-none}, want $HEAD_SHA) - retry $i"
+            sleep 10
+            { git -c http.extraheader="AUTHORIZATION: basic $AUTH" fetch origin "refs/pull/$PR/merge" \
+                && git checkout --force FETCH_HEAD; } || true
+          done
+          echo "::error::refs/pull/$PR/merge never caught up to $HEAD_SHA (conflict or GitHub lag) - re-invoke the round"
+          exit 1
+
+      - name: Reviewer contract comes from the DEFAULT branch (a PR must not edit its own reviewer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEF=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          # A PR could add/weaken AGENTS.md files to soften the rules that judge it. Neutralize:
+          # every AGENTS.md in the checkout is replaced by the default branch's version (files
+          # the default branch doesn't carry are removed). The diff still SHOWS the PR's
+          # AGENTS.md changes, so the reviewer reviews them — it just doesn't OBEY them yet.
+          find . -name 'AGENTS.md' -not -path './.git/*' -delete
+          git ls-tree -r --name-only "origin/$DEF" | grep -E '(^|/)AGENTS\.md$' | while read -r f; do
+            mkdir -p "$(dirname "$f")"
+            git show "origin/$DEF:$f" > "$f"
+          done
+          echo "reviewer contract pinned to origin/$DEF"
 
       - name: Assemble prompt (estate prompt + round memory)
         env:
@@ -81,34 +164,64 @@ jobs:
           test -s "$RUNNER_TEMP/prompt.md"
 
           # Round memory (D12): EVERY prior gauntlet round and EVERY builder reply
-          # (FIXED/DISPOSED/SOLVED), complete and untruncated â€” a dropped disposal gets
+          # (FIXED/DISPOSED/SOLVED), complete and untruncated — a dropped disposal gets
           # re-litigated, which is the exact failure D12 exists to prevent. Everything else on
           # the PR (digest comments, human chatter) is deliberately NOT fed: it isn't memory,
           # and it's what bloats. Rounds and replies are individually small, so the total stays
           # bounded by the loop's own discipline (one reply per finding, one comment per round).
+          # TRUST FILTER: rounds only from github-actions[bot] (the workflow's own poster);
+          # builder replies only from OWNER/MEMBER/COLLABORATOR — a drive-by commenter must not
+          # be able to inject a fake disposal and suppress re-review of a real finding.
+          # NB: fetch and filter are SEPARATE commands — gh rejects --paginate --slurp combined
+          # with --jq (proven in run logs: every prior round silently fell to the no-memory
+          # fallback), so the pages land in a file and the runner's real jq does the filtering.
+          # FAIL CLOSED: memory assembly has no fallback — a review without prior DISPOSED
+          # replies re-litigates settled findings, the exact failure D12 exists to prevent.
+          # set -e fails the step here; the crash handler marks the round for re-invoke.
           {
             echo ""
             echo "## Round memory (prior rounds and builder replies on this PR, oldest first)"
             echo ""
-            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --slurp \
-              --jq '[.[][]] | map(select((.body | startswith("<!-- pr-gauntlet round")) or (.body | startswith("<!-- codex-review round")) or (.body | test("^(FIXED|DISPOSED|SOLVED)")))) | .[] | "---\n[" + .user.login + " Â· " + .created_at + "]\n" + .body'
-          } >> "$RUNNER_TEMP/prompt.md" || echo "(round memory unavailable - review without it)" >> "$RUNNER_TEMP/prompt.md"
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --slurp > "$RUNNER_TEMP/comments.json"
+            jq -r '[.[][]] | map(select(
+                (((.body | startswith("<!-- pr-gauntlet round")) or (.body | startswith("<!-- codex-review round"))) and (.user.login == "github-actions[bot]"))
+                or
+                ((.body | test("^(FIXED|DISPOSED|SOLVED)")) and (.author_association | IN("OWNER","MEMBER","COLLABORATOR")))
+              )) | .[] | "---\n[" + .user.login + " · " + .created_at + "]\n" + .body' "$RUNNER_TEMP/comments.json"
+          } >> "$RUNNER_TEMP/prompt.md"
 
-      - name: Run the reviewer (GPT-5.5 Â· thinking high Â· priority tier)
+      - name: Run the reviewer (GPT-5.5 · thinking high)
         id: codex
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: ${{ runner.temp }}/prompt.md
-          codex-args: '["-c","model=\"gpt-5.5\"","-c","model_reasoning_effort=\"high\"","-c","service_tier=\"priority\""]'
+          codex-args: '["-c","model=\"gpt-5.5\"","-c","model_reasoning_effort=\"high\""]'
 
       - name: Post findings + verdict gate
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEW: ${{ steps.codex.outputs.final-message }}
           PR: ${{ needs.guard.outputs.pr }}
+          HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
         run: |
+          # The status IS the merge signal - writes retry, and a green exit REQUIRES the green
+          # status to have landed (a PASS with a stale/pending required status would strand the
+          # gate). Failure-path writes stay best-effort: the job's own exit 1 already reddens
+          # the run, and the crash handler re-tries any stranded pending.
+          set_status() {
+            for attempt in 1 2 3; do
+              if gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+                   -f state="$1" -f context=pr-gauntlet/review -f description="$2" \
+                   -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; then
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
           if [ -z "$REVIEW" ]; then
+            set_status failure "round produced no output - re-invoke" || true
             echo "::error::the reviewer produced no output - treat as a failed round, re-invoke"
             exit 1
           fi
@@ -116,24 +229,111 @@ jobs:
           # The marker records the reviewed sha so tooling matches rounds to heads exactly.
           { echo "<!-- pr-gauntlet round sha:${{ needs.guard.outputs.head_sha }} -->"; echo '## Gauntlet review (GPT-5.5)'; echo; cat review.md; } > comment.md
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md
-          # Anchor on the LAST verdict line â€” a body that merely quotes "VERDICT: PASS"
-          # (e.g. reviewing these very docs) must not pass a FAIL round.
-          FINAL_VERDICT=$(grep -E '^VERDICT: (PASS|FAIL)$' review.md | tail -n 1)
-          if [ "$FINAL_VERDICT" = "VERDICT: PASS" ]; then
-            echo "pr-gauntlet review: PASS"
-          else
-            echo "::error::pr-gauntlet review verdict: ${FINAL_VERDICT:-MISSING} - P1/P2 findings posted on the PR"
+          # Anchor on the LAST verdict line — a body that merely quotes "VERDICT: PASS"
+          # (e.g. reviewing these very docs) must not pass a FAIL round. A round with no
+          # verdict line at all is malformed and fails closed, on every dial — the || true
+          # keeps grep's no-match exit from ever killing the step under -e/pipefail, so THIS
+          # branch (not the crash handler) writes the descriptive terminal status.
+          FINAL_VERDICT=$(grep -E '^VERDICT: (PASS|FAIL)$' review.md | tail -n 1 || true)
+          if [ -z "$FINAL_VERDICT" ]; then
+            set_status failure "round produced no verdict line - re-invoke" || true
+            echo "::error::the reviewer output carried no final VERDICT line - malformed round, fail closed; re-invoke"
             exit 1
+          fi
+          # The check is dial-aware (D15, BRD F4): on dial:ship-to-learn only P1 findings
+          # redden the round — a P2s-only round is a PASSING check (the P2s still posted in
+          # the comment above; they stay visible, they just don't gate). standard/high-stakes
+          # keep the VERDICT-line gate. The lenient gate applies ONLY when dial:ship-to-learn
+          # is present as an EXACT label name (one per line, grep -x — a label like
+          # "dial:ship-to-learn test" is unknown, not lenient): conflicting dial labels
+          # resolve to the strictest recognized dial, and when none is recognized (absent,
+          # unreadable, unknown) the gate falls back to standard — never a free pass.
+          DIAL_LABELS=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels \
+            --jq '.labels[].name' || echo "")
+          has_label() { printf '%s\n' "$DIAL_LABELS" | grep -qxF "$1"; }
+          if   has_label dial:high-stakes;   then DIAL=dial:high-stakes
+          elif has_label dial:standard;      then DIAL=dial:standard
+          elif has_label dial:ship-to-learn; then DIAL=dial:ship-to-learn
+          else DIAL=dial:standard
+          fi
+          if [ "$DIAL" = "dial:ship-to-learn" ]; then
+            # P1 presence is tested ONLY against THIS round's reviewer output (review.md is
+            # the codex step's final message) — never the assembled round-memory feed, which
+            # by design carries prior rounds' P1 lines and would redden every round forever.
+            # Line-anchored like the VERDICT anchor: prose that merely mentions "P1" (or a
+            # reviewed doc containing the token) must not trip the gate.
+            if grep -qE '^[-*]? ?P1:' review.md; then
+              set_status failure "P1 findings posted - work the round" || true
+              echo "::error::pr-gauntlet review ($DIAL): P1 findings posted on the PR - work the round"
+              exit 1
+            fi
+            GREEN_DESC="no P1 findings (ship-to-learn) for ${HEAD_SHA:0:7}"
+          else
+            if [ "$FINAL_VERDICT" != "VERDICT: PASS" ]; then
+              set_status failure "P1/P2 findings posted - work the round" || true
+              echo "::error::pr-gauntlet review verdict: $FINAL_VERDICT ($DIAL) - P1/P2 findings posted on the PR"
+              exit 1
+            fi
+            GREEN_DESC="clean round for ${HEAD_SHA:0:7}"
+          fi
+          if ! set_status success "$GREEN_DESC"; then
+            echo "::error::round PASSED but the success status could not be written - the merge signal is stale; re-invoke"
+            exit 1
+          fi
+          echo "pr-gauntlet review: PASS ($GREEN_DESC)"
+
+      - name: Terminal status on crash (a required check must never strand at pending)
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
+        run: |
+          # Reached only when an earlier step died BEFORE the verdict gate wrote a terminal
+          # state (checkout, prompt assembly, the codex action itself - e.g. a quota trip).
+          # The verdict gate's own success/failure writes win because this step re-writes the
+          # same conclusion; a stranded 'pending' is the only state this exists to prevent.
+          STATE=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq '.statuses[] | select(.context=="pr-gauntlet/review") | .state' | head -n 1)
+          if [ "$STATE" = "pending" ] || [ -z "$STATE" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state=failure -f context=pr-gauntlet/review \
+              -f description="round crashed before a verdict - re-invoke" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
           fi
 
   validate:
     runs-on: ubuntu-latest
     needs: guard
+    permissions:
+      contents: read   # runs the PR's own validate.ps1 - never give this job a write token
     steps:
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ needs.guard.outputs.pr }}/merge
+          fetch-depth: 2   # the merge commit + its parents - the freshness check reads HEAD^2
           persist-credentials: false
+
+      - name: Merge ref must be fresh for the validated head (same law as the review job)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.guard.outputs.pr }}
+          HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # Same freshness law as the review job: refs/pull/N/merge updates asynchronously, and
+          # validating a stale merge would report a result for a head this job never tested.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          for i in 1 2 3 4 5 6; do
+            MERGE_PR_PARENT=$(git rev-parse -q --verify HEAD^2 || true)
+            if [ "$MERGE_PR_PARENT" = "$HEAD_SHA" ]; then
+              echo "merge ref fresh: HEAD^2 = $HEAD_SHA"; exit 0
+            fi
+            echo "merge ref stale (PR parent ${MERGE_PR_PARENT:-none}, want $HEAD_SHA) - retry $i"
+            sleep 10
+            { git -c http.extraheader="AUTHORIZATION: basic $AUTH" fetch --depth 2 origin "refs/pull/$PR/merge" \
+                && git checkout --force FETCH_HEAD; } || true
+          done
+          echo "::error::refs/pull/$PR/merge never caught up to $HEAD_SHA (conflict or GitHub lag) - re-invoke the round"
+          exit 1
 
       - name: Run the repo's validation hook (if present)
         shell: pwsh
