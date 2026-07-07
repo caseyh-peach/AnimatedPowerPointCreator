@@ -253,7 +253,31 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ needs.guard.outputs.pr }}/merge
+          fetch-depth: 2   # the merge commit + its parents - the freshness check reads HEAD^2
           persist-credentials: false
+
+      - name: Merge ref must be fresh for the validated head (same law as the review job)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.guard.outputs.pr }}
+          HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # Same freshness law as the review job: refs/pull/N/merge updates asynchronously, and
+          # validating a stale merge would report a result for a head this job never tested.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          for i in 1 2 3 4 5 6; do
+            MERGE_PR_PARENT=$(git rev-parse -q --verify HEAD^2 || true)
+            if [ "$MERGE_PR_PARENT" = "$HEAD_SHA" ]; then
+              echo "merge ref fresh: HEAD^2 = $HEAD_SHA"; exit 0
+            fi
+            echo "merge ref stale (PR parent ${MERGE_PR_PARENT:-none}, want $HEAD_SHA) - retry $i"
+            sleep 10
+            { git -c http.extraheader="AUTHORIZATION: basic $AUTH" fetch --depth 2 origin "refs/pull/$PR/merge" \
+                && git checkout --force FETCH_HEAD; } || true
+          done
+          echo "::error::refs/pull/$PR/merge never caught up to $HEAD_SHA (conflict or GitHub lag) - re-invoke the round"
+          exit 1
 
       - name: Run the repo's validation hook (if present)
         shell: pwsh
