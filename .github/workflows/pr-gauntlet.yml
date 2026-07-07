@@ -1,0 +1,130 @@
+# pr-gauntlet â€” THE estate PR workflow (D11): one shape on every repo, PR â†’ main.
+# CANONICAL COPY: caseyh-peach/TheApiary Â· infrastructure/pr-gauntlet/pr-gauntlet.yml
+# Deployed per repo as .github/workflows/pr-gauntlet.yml by deploy-pr-gauntlet.ps1.
+# Three standardized jobs:
+#   guard    â€” AGENTS.md must exist (the reviewer's contract; enforced, never policy-hoped)
+#   review   â€” the direct-invoke reviewer (GPT-5.5 Â· thinking-high Â· priority tier) WITH round
+#              memory (D12): prior rounds + the builder's FIXED/DISPOSED replies feed the prompt,
+#              so disposals stick and fixes get re-verified instead of re-litigated
+#   validate â€” optional, standardized: runs .github/validate.ps1 if the repo carries one
+# The review job's pass/fail (its VERDICT line) is the merge signal.
+# Secret required per repo: OPENAI_API_KEY (rotate via ../pr-gauntlet/set-openai-key.ps1).
+name: pr-gauntlet
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to run the gauntlet on'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-gauntlet-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.pr.outputs.num }}
+    steps:
+      - name: Resolve PR number
+        id: pr
+        run: echo "num=${{ github.event.pull_request.number || github.event.inputs.pr }}" >> "$GITHUB_OUTPUT"
+
+      - name: AGENTS.md must exist (the reviewer's contract)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api "repos/$GITHUB_REPOSITORY/contents/AGENTS.md" --jq .sha >/dev/null 2>&1; then
+            echo "::error::AGENTS.md is missing on the default branch - the reviewer has no contract to review against. Deploy the estate block (TheApiary infrastructure/pr-gauntlet/deploy-agents-block.ps1) before this PR can run the gauntlet."
+            exit 1
+          fi
+          echo "guard: AGENTS.md present"
+
+  review:
+    runs-on: ubuntu-latest
+    needs: guard
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.guard.outputs.pr }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assemble prompt (estate prompt + round memory)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.guard.outputs.pr }}
+        run: |
+          set -euo pipefail
+          # Estate prompt from the default branch (never the PR snapshot - a PR must not edit its own reviewer).
+          gh api "repos/$GITHUB_REPOSITORY/contents/.github/codex/prompts/review.md" \
+            --jq .content | base64 -d > "$RUNNER_TEMP/prompt.md"
+          test -s "$RUNNER_TEMP/prompt.md"
+
+          # Round memory (D12): every prior gauntlet round + every builder reply on this PR.
+          # The prompt's round-memory rules tell the reviewer what to do with them.
+          {
+            echo ""
+            echo "## Round memory (prior rounds and builder replies on this PR, oldest first)"
+            echo ""
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+              --jq '.[] | "---\n[" + .user.login + " Â· " + .created_at + "]\n" + .body' \
+              | tail -c 60000
+          } >> "$RUNNER_TEMP/prompt.md" || echo "(round memory unavailable - review without it)" >> "$RUNNER_TEMP/prompt.md"
+
+      - name: Run the reviewer (GPT-5.5 Â· thinking high Â· priority tier)
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/prompt.md
+          codex-args: '["-c","model=\"gpt-5.5\"","-c","model_reasoning_effort=\"high\"","-c","service_tier=\"priority\""]'
+
+      - name: Post findings + verdict gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW: ${{ steps.codex.outputs.final-message }}
+          PR: ${{ needs.guard.outputs.pr }}
+        run: |
+          if [ -z "$REVIEW" ]; then
+            echo "::error::the reviewer produced no output - treat as a failed round, re-invoke"
+            exit 1
+          fi
+          printf '%s\n' "$REVIEW" > review.md
+          { echo '<!-- pr-gauntlet round -->'; echo '## Gauntlet review (GPT-5.5)'; echo; cat review.md; } > comment.md
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md
+          if grep -q "VERDICT: PASS" review.md; then
+            echo "pr-gauntlet review: PASS"
+          else
+            echo "::error::pr-gauntlet review verdict: FAIL - P1/P2 findings posted on the PR"
+            exit 1
+          fi
+
+  validate:
+    runs-on: ubuntu-latest
+    needs: guard
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.guard.outputs.pr }}/merge
+          persist-credentials: false
+
+      - name: Run the repo's validation hook (if present)
+        shell: pwsh
+        run: |
+          if (Test-Path '.github/validate.ps1') {
+            Write-Host 'validate: running .github/validate.ps1'
+            pwsh -NoProfile -File .github/validate.ps1
+            if ($LASTEXITCODE -ne 0) { throw "validation hook failed ($LASTEXITCODE)" }
+          } else {
+            Write-Host 'validate: no .github/validate.ps1 in this repo - skipped (standardized optional hook)'
+          }
