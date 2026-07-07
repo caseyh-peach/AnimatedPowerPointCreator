@@ -24,6 +24,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  statuses: write
 
 concurrency:
   group: pr-gauntlet-${{ github.event.pull_request.number || github.event.inputs.pr }}
@@ -59,6 +60,18 @@ jobs:
           fi
           echo "guard: AGENTS.md present"
 
+      - name: Mark the head as in-review (sha-attached status, trigger-independent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The commit STATUS (context pr-gauntlet/review) rides the PR head sha itself, so
+          # required-check wiring works identically for push rounds AND on-demand rounds
+          # (a plain workflow_dispatch run's job check attaches to the dispatch ref, not the PR).
+          gh api "repos/$GITHUB_REPOSITORY/statuses/${{ steps.pr.outputs.head_sha }}" \
+            -f state=pending -f context=pr-gauntlet/review \
+            -f description="round in progress" \
+            -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
   review:
     runs-on: ubuntu-latest
     needs: guard
@@ -68,6 +81,23 @@ jobs:
           ref: refs/pull/${{ needs.guard.outputs.pr }}/merge
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Reviewer contract comes from the DEFAULT branch (a PR must not edit its own reviewer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEF=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          # A PR could add/weaken AGENTS.md files to soften the rules that judge it. Neutralize:
+          # every AGENTS.md in the checkout is replaced by the default branch's version (files
+          # the default branch doesn't carry are removed). The diff still SHOWS the PR's
+          # AGENTS.md changes, so the reviewer reviews them â€” it just doesn't OBEY them yet.
+          find . -name 'AGENTS.md' -not -path './.git/*' -delete
+          git ls-tree -r --name-only "origin/$DEF" | grep -E '(^|/)AGENTS\.md$' | while read -r f; do
+            mkdir -p "$(dirname "$f")"
+            git show "origin/$DEF:$f" > "$f"
+          done
+          echo "reviewer contract pinned to origin/$DEF"
 
       - name: Assemble prompt (estate prompt + round memory)
         env:
@@ -107,8 +137,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REVIEW: ${{ steps.codex.outputs.final-message }}
           PR: ${{ needs.guard.outputs.pr }}
+          HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
         run: |
+          set_status() {
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state="$1" -f context=pr-gauntlet/review -f description="$2" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
+          }
           if [ -z "$REVIEW" ]; then
+            set_status failure "round produced no output - re-invoke"
             echo "::error::the reviewer produced no output - treat as a failed round, re-invoke"
             exit 1
           fi
@@ -120,8 +157,10 @@ jobs:
           # (e.g. reviewing these very docs) must not pass a FAIL round.
           FINAL_VERDICT=$(grep -E '^VERDICT: (PASS|FAIL)$' review.md | tail -n 1)
           if [ "$FINAL_VERDICT" = "VERDICT: PASS" ]; then
+            set_status success "clean round for ${HEAD_SHA:0:7}"
             echo "pr-gauntlet review: PASS"
           else
+            set_status failure "P1/P2 findings posted - work the round"
             echo "::error::pr-gauntlet review verdict: ${FINAL_VERDICT:-MISSING} - P1/P2 findings posted on the PR"
             exit 1
           fi
