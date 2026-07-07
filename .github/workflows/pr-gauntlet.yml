@@ -3,9 +3,9 @@
 # Deployed per repo as .github/workflows/pr-gauntlet.yml by deploy-pr-gauntlet.ps1.
 # Three standardized jobs:
 #   guard    â€” AGENTS.md must exist (the reviewer's contract; enforced, never policy-hoped)
-#   review   â€” the direct-invoke reviewer (GPT-5.5 Â· thinking-high Â· priority tier) WITH round
-#              memory (D12): prior rounds + the builder's FIXED/DISPOSED replies feed the prompt,
-#              so disposals stick and fixes get re-verified instead of re-litigated
+#   review   â€” the direct-invoke reviewer (GPT-5.5 Â· thinking-high) WITH round memory (D12):
+#              prior rounds + the builder's FIXED/DISPOSED replies feed the prompt, so disposals
+#              stick and fixes get re-verified instead of re-litigated
 #   validate â€” optional, standardized: runs .github/validate.ps1 if the repo carries one
 # The review job's pass/fail (its VERDICT line) is the merge signal.
 # Secret required per repo: OPENAI_API_KEY (rotate via ../pr-gauntlet/set-openai-key.ps1).
@@ -34,10 +34,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pr: ${{ steps.pr.outputs.num }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
     steps:
-      - name: Resolve PR number
+      - name: Resolve PR number + reviewed head
         id: pr
-        run: echo "num=${{ github.event.pull_request.number || github.event.inputs.pr }}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NUM="${{ github.event.pull_request.number || github.event.inputs.pr }}"
+          echo "num=$NUM" >> "$GITHUB_OUTPUT"
+          SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$SHA" ]; then
+            SHA=$(gh pr view "$NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          fi
+          echo "head_sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: AGENTS.md must exist (the reviewer's contract)
         env:
@@ -70,24 +80,27 @@ jobs:
             --jq .content | base64 -d > "$RUNNER_TEMP/prompt.md"
           test -s "$RUNNER_TEMP/prompt.md"
 
-          # Round memory (D12): every prior gauntlet round + every builder reply on this PR.
-          # The prompt's round-memory rules tell the reviewer what to do with them.
+          # Round memory (D12): EVERY prior gauntlet round and EVERY builder reply
+          # (FIXED/DISPOSED/SOLVED), complete and untruncated â€” a dropped disposal gets
+          # re-litigated, which is the exact failure D12 exists to prevent. Everything else on
+          # the PR (digest comments, human chatter) is deliberately NOT fed: it isn't memory,
+          # and it's what bloats. Rounds and replies are individually small, so the total stays
+          # bounded by the loop's own discipline (one reply per finding, one comment per round).
           {
             echo ""
             echo "## Round memory (prior rounds and builder replies on this PR, oldest first)"
             echo ""
-            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-              --jq '.[] | "---\n[" + .user.login + " Â· " + .created_at + "]\n" + .body' \
-              | tail -c 60000
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --slurp \
+              --jq '[.[][]] | map(select((.body | startswith("<!-- pr-gauntlet round")) or (.body | startswith("<!-- codex-review round")) or (.body | test("^(FIXED|DISPOSED|SOLVED)")))) | .[] | "---\n[" + .user.login + " Â· " + .created_at + "]\n" + .body'
           } >> "$RUNNER_TEMP/prompt.md" || echo "(round memory unavailable - review without it)" >> "$RUNNER_TEMP/prompt.md"
 
-      - name: Run the reviewer (GPT-5.5 Â· thinking high Â· priority tier)
+      - name: Run the reviewer (GPT-5.5 Â· thinking high)
         id: codex
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: ${{ runner.temp }}/prompt.md
-          codex-args: '["-c","model=\"gpt-5.5\"","-c","model_reasoning_effort=\"high\"","-c","service_tier=\"priority\""]'
+          codex-args: '["-c","model=\"gpt-5.5\"","-c","model_reasoning_effort=\"high\""]'
 
       - name: Post findings + verdict gate
         env:
@@ -100,12 +113,16 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$REVIEW" > review.md
-          { echo '<!-- pr-gauntlet round -->'; echo '## Gauntlet review (GPT-5.5)'; echo; cat review.md; } > comment.md
+          # The marker records the reviewed sha so tooling matches rounds to heads exactly.
+          { echo "<!-- pr-gauntlet round sha:${{ needs.guard.outputs.head_sha }} -->"; echo '## Gauntlet review (GPT-5.5)'; echo; cat review.md; } > comment.md
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md
-          if grep -q "VERDICT: PASS" review.md; then
+          # Anchor on the LAST verdict line â€” a body that merely quotes "VERDICT: PASS"
+          # (e.g. reviewing these very docs) must not pass a FAIL round.
+          FINAL_VERDICT=$(grep -E '^VERDICT: (PASS|FAIL)$' review.md | tail -n 1)
+          if [ "$FINAL_VERDICT" = "VERDICT: PASS" ]; then
             echo "pr-gauntlet review: PASS"
           else
-            echo "::error::pr-gauntlet review verdict: FAIL - P1/P2 findings posted on the PR"
+            echo "::error::pr-gauntlet review verdict: ${FINAL_VERDICT:-MISSING} - P1/P2 findings posted on the PR"
             exit 1
           fi
 
