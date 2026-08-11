@@ -235,8 +235,10 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$REVIEW" > review.md
-          # The marker records the reviewed sha so tooling matches rounds to heads exactly.
-          { echo "<!-- pr-gauntlet round sha:${{ needs.guard.outputs.head_sha }} -->"; echo '## Gauntlet review (GPT-5.5)'; echo; cat review.md; } > comment.md
+          # The marker records both reviewed head and merge result. A base-branch advance changes
+          # refs/pull/N/merge without changing the PR head, so both identities gate freshness.
+          MERGE_SHA=$(git rev-parse HEAD)
+          { echo "<!-- pr-gauntlet round sha:${{ needs.guard.outputs.head_sha }} merge:$MERGE_SHA -->"; echo '## Gauntlet review (GPT-5.5)'; echo; cat review.md; } > comment.md
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md
           # Anchor on the LAST verdict line — a body that merely quotes "VERDICT: PASS"
           # (e.g. reviewing these very docs) must not pass a FAIL round. A round with no
