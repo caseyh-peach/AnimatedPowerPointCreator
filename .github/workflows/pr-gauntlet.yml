@@ -205,7 +205,7 @@ jobs:
           permission-profile: ":read-only"
           safety-strategy: drop-sudo
           prompt-file: ${{ runner.temp }}/prompt.md
-          codex-args: '["-c","model=\"gpt-6.1-sol\"","-c","model_reasoning_effort=\"high\"","-c","service_tier=\"default\""]'
+          codex-args: '["-c","model=\"gpt-6.1-sol\"","-c","model_reasoning_effort=\"high\"","-c","model_supports_reasoning_summaries=true","-c","service_tier=\"default\""]'
 
       - name: Post findings + verdict gate
         env:
